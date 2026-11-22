@@ -1,0 +1,31 @@
+{
+  "entry": {
+    "ssh": {
+      "host": "198.51.100.10",
+      "user": "ubuntu",
+      "port": 22,
+      "identity_file": null,
+      "password_file": null
+    },
+    "ipv4": "198.51.100.10",
+    "ipv6": "2001:db8:100::10",
+    "wan": "ens3"
+  },
+  "exit": {
+    "ssh": {
+      "host": "203.0.113.20",
+      "user": "root",
+      "port": 22,
+      "identity_file": null,
+      "password_file": null
+    },
+    "ipv4": "203.0.113.20",
+    "ipv6": "2001:db8:200::1",
+    "ipv6_prefix": "2001:db8:200::/64",
+    "wan": "eth0"
+  },
+  "entry_port": 443,
+  "hop_port": 51821,
+  "mtu": 1280,
+  "clients": ["phone", "laptop", "desktop"]
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Persistent cascade firewall and fail-closed routing
+Wants=network-online.target
+After=network-online.target
+Before=cascade-awg@awg-clients.service cascade-awg@awg-eu.service cascade-awg@awg-ru.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cascadectl firewall
+ExecReload=/usr/local/sbin/cascadectl firewall
+[Install]
+WantedBy=multi-user.target

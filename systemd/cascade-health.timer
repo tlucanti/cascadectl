@@ -1,0 +1,8 @@
+[Unit]
+Description=Periodic cascade health check
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+[Install]
+WantedBy=timers.target

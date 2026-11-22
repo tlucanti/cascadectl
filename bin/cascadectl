@@ -1,0 +1,729 @@
+#!/usr/bin/python3
+"""Root-owned management for the RU -> EU AmneziaWG cascade."""
+import contextlib
+import argparse
+import datetime
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import tarfile
+
+BASE = Path('/etc/cascade')
+CONF = Path('/etc/amnezia/amneziawg')
+SPECIAL = ('0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, '
+           '169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, '
+           '192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, '
+           '203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4')
+
+def run(args, data=None, check=True, timeout=30):
+    p = subprocess.run(args, input=data, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=timeout)
+    if check and p.returncode:
+        detail = re.sub(r'[A-Za-z0-9+/]{43}=', '<redacted-key>', p.stderr.strip())
+        raise RuntimeError(f'{args[0]} failed ({p.returncode}): {detail}')
+    return p
+
+def atomic(path, body, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+def readj(path):
+    return json.loads(Path(path).read_text())
+
+def writej(path, value):
+    atomic(path, json.dumps(value, indent=2) + '\n')
+
+@contextlib.contextmanager
+def lock():
+    with open('/run/lock/cascade-config.lock', 'w') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+def state():
+    s = readj(BASE / 'state.json')
+    if s.get('role') not in ['ru', 'eu']:
+        raise ValueError('State role must be ru (entry) or eu (exit)')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', s.get('wan', '')):
+        raise ValueError('Invalid WAN interface name')
+    ipaddress.IPv4Address(s['public_ipv4'])
+    ipaddress.IPv6Address(s['ru_ipv6'])
+    if '%' in s['ru_ipv6']:
+        raise ValueError('The entry IPv6 address must be unscoped')
+    prefix = ipaddress.IPv6Network(s['eu_prefix'], strict=True)
+    if prefix.prefixlen != 64:
+        raise ValueError('IPv6 rotation requires an allocated /64')
+    for name in ['eu_ipv6', 'eu_primary_ipv6', 'eu_active_ipv6']:
+        if name in s:
+            if '%' in s[name]:
+                raise ValueError('Tunnel endpoints must be unscoped IPv6 addresses')
+            a = ipaddress.IPv6Address(s[name])
+            if a not in prefix or a == prefix.network_address:
+                raise ValueError(name + ' must be a host address in the exit /64')
+    for name in ['entry_port', 'hop_port']:
+        if type(s[name]) is not int or not 1 <= s[name] <= 65535:
+            raise ValueError('Invalid ' + name)
+    if s['entry_port'] == s['hop_port']:
+        raise ValueError('Entry and interserver ports must differ')
+    if s['hop_port'] == 53:
+        raise ValueError('The interserver port must differ from the DNS port 53')
+    if type(s.get('mtu', 1280)) is not int or not 1280 <= s.get('mtu', 1280) <= 1420:
+        raise ValueError('MTU must be between 1280 and 1420')
+    if s['role'] == 'ru':
+        ipaddress.IPv4Address(s['eu_admin_ipv4'])
+        if 'eu_primary_ipv6' not in s:
+            raise ValueError('Set eu_primary_ipv6 in state before rotating')
+        if type(s.get('eu_ssh_port', 22)) is not int or not 1 <= s.get('eu_ssh_port', 22) <= 65535:
+            raise ValueError('Invalid exit SSH port')
+    return s
+
+def netset(name, values, version=4):
+    values = [str(ipaddress.ip_network(x, strict=True)) for x in values]
+    if any(ipaddress.ip_network(x).version != version for x in values):
+        raise ValueError('Wrong address family')
+    elements = ('elements = { ' + ', '.join(values) + ' };') if values else ''
+    return f'set {name} {{ type ipv{version}_addr; flags interval; auto-merge; {elements} }}\n'
+
+def firewall():
+    s = state()
+    wan, port = s['wan'], s['hop_port']
+    rules = 'table inet cascade {\n'
+    rules += f'set special4 {{ type ipv4_addr; flags interval; auto-merge; elements = {{ {SPECIAL} }}; }}\n'
+    if s['role'] == 'ru':
+        overrides = readj(BASE / 'overrides.json')
+        rules += netset('ru4', (BASE / 'ru4.zone').read_text().split())
+        rules += netset('force_ru4', overrides['always_russia'])
+        rules += netset('force_eu4', overrides['always_europe'])
+        rules += netset('eu_endpoints6', [s['eu_ipv6'] + '/128'], 6)
+        rules += '''
+chain classify {
+ ip daddr 10.77.0.1 ip protocol icmp ct mark set 0x100 return
+ ip daddr 10.78.0.2 ct mark set 0x200 return
+ ip daddr @special4 counter drop
+ ip daddr @force_eu4 ct mark set 0x200 return
+ ip daddr @force_ru4 ct mark set 0x100 return
+ ip daddr @ru4 ct mark set 0x100 return
+ ct mark set 0x200
+}
+chain mark_clients {
+ type filter hook prerouting priority mangle; policy accept;
+ iifname "awg-clients" meta nfproto ipv4 ct mark & 0x300 == 0 jump classify
+ iifname "awg-clients" meta nfproto ipv4 meta mark set ct mark & 0x300
+}
+'''
+        rules += f'''
+chain input {{
+ type filter hook input priority -20; policy accept;
+ iifname "awg-clients" ip protocol icmp icmp type echo-request counter accept
+ iifname "awg-clients" counter reject with icmpx type admin-prohibited
+ iifname "awg-eu" ct state established,related counter accept
+ iifname "awg-eu" counter drop
+ iifname "{wan}" udp dport {port} ip6 saddr @eu_endpoints6 counter accept
+ udp dport {port} counter drop
+ iifname "{wan}" udp dport {s['entry_port']} meta nfproto ipv4 counter accept
+ udp dport {s['entry_port']} counter drop
+}}
+chain output {{
+ type filter hook output priority -20; policy accept;
+ udp sport {port} ip6 daddr @eu_endpoints6 counter accept
+ udp sport {port} counter drop
+ udp sport {s['entry_port']} meta nfproto ipv6 counter drop
+}}
+chain client_forward {{
+ meta nfproto ipv6 counter reject with icmpv6 type admin-prohibited
+ ct state invalid counter drop
+ ip saddr != 10.77.0.0/24 counter drop
+ ct mark & 0x300 == 0x100 oifname "{wan}" counter accept
+ ct mark & 0x300 == 0x200 oifname "awg-eu" counter accept
+ counter drop
+}}
+chain forward {{
+ type filter hook forward priority -20; policy accept;
+ iifname "awg-clients" jump client_forward
+ oifname "awg-clients" ip daddr 10.77.0.0/24 ct state established,related counter accept
+ oifname "awg-clients" counter drop
+ iifname "awg-eu" counter drop
+}}
+chain nat {{
+ type nat hook postrouting priority srcnat; policy accept;
+ ip saddr 10.77.0.0/24 oifname "{wan}" ct mark & 0x300 == 0x100 counter snat ip to {s['public_ipv4']}
+}}
+'''
+    else:
+        rules += f'''
+chain input {{
+ type filter hook input priority -20; policy accept;
+ iifname "{wan}" udp dport {port} ip6 saddr {s['ru_ipv6']} counter accept
+ udp dport {port} counter drop
+ iifname "awg-ru" ip saddr 10.77.0.0/24 ip daddr 10.78.0.2 udp dport 53 counter accept
+ iifname "awg-ru" ip saddr 10.77.0.0/24 ip daddr 10.78.0.2 tcp dport 53 counter accept
+ iifname "awg-ru" ip saddr 10.78.0.1 ip daddr 10.78.0.2 udp dport 53 counter accept
+ iifname "awg-ru" ip saddr 10.78.0.1 ip daddr 10.78.0.2 tcp dport 53 counter accept
+ iifname "awg-ru" ip saddr {{ 10.77.0.0/24, 10.78.0.1 }} ip protocol icmp counter accept
+ iifname "awg-ru" ct state established,related counter accept
+ iifname "awg-ru" counter drop
+}}
+chain output {{
+ type filter hook output priority -20; policy accept;
+ udp sport {port} ip6 daddr {s['ru_ipv6']} counter accept
+ udp sport {port} counter drop
+}}
+chain forward {{
+ type filter hook forward priority -20; policy accept;
+ iifname "awg-ru" ip saddr != 10.77.0.0/24 counter drop
+ iifname "awg-ru" ip daddr @special4 counter drop
+ iifname "awg-ru" oifname "{wan}" meta nfproto ipv4 counter accept
+ iifname "awg-ru" counter drop
+ oifname "awg-ru" ip daddr 10.77.0.0/24 ct state established,related counter accept
+ oifname "awg-ru" counter drop
+}}
+chain nat {{
+ type nat hook postrouting priority srcnat; policy accept;
+ ip saddr 10.77.0.0/24 oifname "{wan}" counter snat ip to {s['public_ipv4']}
+}}
+'''
+    rules += '}\n'
+    exists = run(['nft', 'list', 'table', 'inet', 'cascade'], check=False).returncode == 0
+    batch = ('delete table inet cascade\n' if exists else '') + rules
+    run(['nft', '-c', '-f', '-'], batch)
+    run(['nft', '-f', '-'], batch)
+    atomic(BASE / 'firewall.generated.nft', rules)
+    run(['sysctl', '-q', '-w', 'net.ipv4.ip_forward=1'])
+    if s['role'] == 'ru':
+        # Even loose RPF consults policy rules. With the fail-closed table
+        # unreachable, it can reject valid direct-path replies during an outage.
+        # Peer AllowedIPs and the scoped forwarding firewall validate sources.
+        settings = ['net.ipv4.conf.all.rp_filter=0', 'net.ipv4.conf.default.rp_filter=0',
+                    'net.ipv4.conf.' + wan + '.rp_filter=0']
+        for name in ['awg-clients', 'awg-eu']:
+            if Path('/proc/sys/net/ipv4/conf/' + name).exists():
+                settings.append('net.ipv4.conf.' + name + '.rp_filter=0')
+        run(['sysctl', '-q', '-w'] + settings)
+        run(['ip', '-4', 'route', 'replace', 'unreachable', 'default', 'table', '220', 'metric', '32760'])
+        expected = [(10000, ['iif', 'awg-clients', 'fwmark', '0x100/0x300', 'lookup', 'main']),
+                    (10010, ['iif', 'awg-clients', 'lookup', '220']),
+                    (10020, ['iif', 'awg-clients', 'unreachable'])]
+        actual = {int(x.split(':', 1)[0]) for x in run(['ip', '-4', 'rule', 'show']).stdout.splitlines()}
+        for priority, args in expected:
+            if priority not in actual:
+                run(['ip', '-4', 'rule', 'add', 'priority', str(priority)] + args)
+    else:
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.all.rp_filter=2'])
+
+def interface(action, name):
+    s = state()
+    allowed = ['awg-clients', 'awg-eu'] if s['role'] == 'ru' else ['awg-ru']
+    if name not in allowed:
+        raise ValueError('Unknown managed interface')
+    if action == 'down':
+        run(['ip', 'link', 'delete', 'dev', name], check=False)
+        return
+    for _ in range(100):
+        if Path('/var/run/amneziawg/' + name + '.sock').exists():
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError('AmneziaWG control socket did not appear')
+    raw = (CONF / (name + '.conf')).read_text()
+    stripped = run(['/usr/local/bin/awg-quick', 'strip', str(CONF / (name + '.conf'))]).stdout
+    run(['/usr/local/bin/awg', 'setconf', name, '/dev/stdin'], stripped)
+    section = raw.split('[Peer]', 1)[0]
+    addresses = re.search(r'^Address\s*=\s*(.+)$', section, re.M).group(1)
+    mtu = re.search(r'^MTU\s*=\s*(\d+)', section, re.M).group(1)
+    for address in addresses.split(','):
+        run(['ip', 'address', 'replace', address.strip(), 'dev', name])
+    run(['ip', 'link', 'set', 'dev', name, 'mtu', mtu, 'up'])
+    if s['role'] == 'ru':
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.' + name + '.rp_filter=0'])
+    if name == 'awg-eu':
+        run(['ip', '-4', 'route', 'replace', 'default', 'dev', name, 'table', '220', 'metric', '10'])
+    if name == 'awg-ru':
+        run(['ip', '-4', 'route', 'replace', '10.77.0.0/24', 'dev', name])
+        alias('activate', s.get('eu_active_ipv6', s['eu_ipv6']))
+
+def docker_allow():
+    s = state()
+    if s['role'] != 'eu' or not s.get('docker_managed', True):
+        return
+    for rule in [
+        ['-i', 'awg-ru', '-s', '10.77.0.0/24', '-o', s['wan'], '-j', 'ACCEPT'],
+        ['-i', s['wan'], '-o', 'awg-ru', '-d', '10.77.0.0/24', '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT']
+    ]:
+        if run(['iptables', '-w', '10', '-C', 'DOCKER-USER'] + rule, check=False).returncode:
+            run(['iptables', '-w', '10', '-I', 'DOCKER-USER', '1'] + rule)
+
+def geo_update():
+    if state()['role'] != 'ru':
+        raise ValueError('Country prefix updates belong on the entry server')
+    req = urllib.request.Request('https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone',
+                                 headers={'User-Agent': 'Private-cascade/1.0'})
+    with urllib.request.urlopen(req, timeout=40) as response:
+        raw = response.read(4_000_001)
+        if len(raw) > 4_000_000:
+            raise ValueError('Country list exceeds its size limit')
+        payload = raw.decode('ascii')
+    nets = list(ipaddress.collapse_addresses(ipaddress.ip_network(x.strip(), strict=True)
+                for x in payload.splitlines() if x.strip()))
+    if not 100 <= len(nets) <= 50000 or any(x.version != 4 or x.prefixlen < 8 or not x.is_global for x in nets):
+        raise ValueError('Country list validation failed')
+    total = sum(x.num_addresses for x in nets)
+    if not 1_000_000 < total < 1_000_000_000:
+        raise ValueError('Country list address count is implausible')
+    previous = BASE / 'ru4.zone'
+    if previous.exists():
+        old = [ipaddress.ip_network(x) for x in previous.read_text().split()]
+        oldtotal = sum(x.num_addresses for x in old)
+        if not 0.75 < total / oldtotal < 1.25:
+            raise ValueError('Country list changed by more than 25%; keeping cached list')
+    batch = 'flush set inet cascade ru4\nadd element inet cascade ru4 { ' + ', '.join(map(str, nets)) + ' }\n'
+    exists = run(['nft', 'list', 'set', 'inet', 'cascade', 'ru4'], check=False).returncode == 0
+    if exists:
+        run(['nft', '-c', '-f', '-'], batch)
+        run(['nft', '-f', '-'], batch)
+    atomic(previous, '\n'.join(map(str, nets)) + '\n')
+    print(json.dumps({'prefixes': len(nets), 'addresses': total, 'updated_utc': int(time.time())}))
+
+def sync_clients():
+    s = state()
+    clients = readj(BASE / 'clients.json')
+    raw = f'''[Interface]
+PrivateKey = {(BASE / 'keys/entry.key').read_text().strip()}
+Address = 10.77.0.1/24, fd67:a2e4:9b01:1::1/64
+ListenPort = {s['entry_port']}
+MTU = {s.get('mtu', 1280)}
+Table = off
+''' + (BASE / 'entry-obfuscation.conf').read_text()
+    for c in clients:
+        raw += f'''\n[Peer]
+# {c['name']}
+PublicKey = {c['public_key']}
+PresharedKey = {c['psk']}
+AllowedIPs = {c['ipv4']}/32, {c['ipv6']}/128
+'''
+    atomic(CONF / 'awg-clients.conf', raw)
+    if run(['ip', 'link', 'show', 'dev', 'awg-clients'], check=False).returncode == 0:
+        stripped = run(['/usr/local/bin/awg-quick', 'strip', str(CONF / 'awg-clients.conf')]).stdout
+        run(['/usr/local/bin/awg', 'syncconf', 'awg-clients', '/dev/stdin'], stripped)
+
+def commit_clients(clients):
+    """Restore the previous database and config if the live update is rejected."""
+    old_database = (BASE / 'clients.json').read_text()
+    config = CONF / 'awg-clients.conf'
+    old_config = config.read_text() if config.exists() else None
+    try:
+        writej(BASE / 'clients.json', clients)
+        sync_clients()
+    except Exception:
+        atomic(BASE / 'clients.json', old_database)
+        if old_config is not None:
+            atomic(config, old_config)
+        try:
+            sync_clients()
+        except Exception:
+            pass
+        raise
+
+def client(action, name=None):
+    if state()['role'] != 'ru':
+        raise ValueError('Client management belongs on the entry server')
+    clients = readj(BASE / 'clients.json')
+    if action == 'list':
+        print(json.dumps([{k: c[k] for k in ['name', 'ipv4', 'ipv6', 'public_key']} for c in clients], indent=2))
+        return
+    if not name or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name):
+        raise ValueError('Use a name with 1-40 letters, digits, underscores or hyphens')
+    matching = [c for c in clients if c['name'] == name]
+    if action == 'remove':
+        if not matching:
+            raise ValueError('Unknown client')
+        commit_clients([c for c in clients if c['name'] != name])
+        (BASE / 'profiles' / (name + '.conf')).unlink(missing_ok=True)
+        print('Removed client ' + name)
+        return
+    if action != 'add' or matching:
+        raise ValueError('Unknown action or client already exists')
+    if len(name) > 15:
+        raise ValueError('Client profile names must be at most 15 characters for app compatibility')
+    used = {c['ipv4'] for c in clients}
+    n = next((i for i in range(10, 240) if '10.77.0.' + str(i) not in used), None)
+    if n is None:
+        raise ValueError('Client address pool is full (230 devices)')
+    private = run(['/usr/local/bin/awg', 'genkey']).stdout.strip()
+    public = run(['/usr/local/bin/awg', 'pubkey'], private + '\n').stdout.strip()
+    c = {'name': name, 'ipv4': '10.77.0.' + str(n), 'ipv6': 'fd67:a2e4:9b01:1::' + format(n, 'x'),
+         'private_key': private, 'public_key': public,
+         'psk': run(['/usr/local/bin/awg', 'genpsk']).stdout.strip()}
+    s = state()
+    profile = f'''[Interface]
+PrivateKey = {private}
+Address = {c['ipv4']}/32, {c['ipv6']}/128
+DNS = 10.78.0.2
+MTU = {s.get('mtu', 1280)}
+''' + (BASE / 'entry-obfuscation.conf').read_text() + f'''
+[Peer]
+PublicKey = {s['entry_public_key']}
+PresharedKey = {c['psk']}
+Endpoint = {s['public_ipv4']}:{s['entry_port']}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+'''
+    (BASE / 'profiles').mkdir(mode=0o700, exist_ok=True)
+    atomic(BASE / 'profiles' / (name + '.conf'), profile)
+    try:
+        commit_clients(clients + [c])
+    except Exception:
+        (BASE / 'profiles' / (name + '.conf')).unlink(missing_ok=True)
+        raise
+    print(str(BASE / 'profiles' / (name + '.conf')))
+
+def override(action, destination=None, cidr=None):
+    if state()['role'] != 'ru':
+        raise ValueError('Route overrides belong on the entry server')
+    path = BASE / 'overrides.json'
+    original = path.read_text()
+    data = json.loads(original)
+    if action == 'list':
+        print(json.dumps(data, indent=2))
+        return
+    network = ipaddress.IPv4Network(cidr, strict=True)
+    if not network.is_global:
+        raise ValueError('Overrides require a globally routable IPv4 network')
+    key = {'russia': 'always_russia', 'europe': 'always_europe'}[destination]
+    item = str(network)
+    if action == 'add':
+        data[key] = sorted(set(data[key]) | {item})
+    elif action == 'remove':
+        if item not in data[key]:
+            raise ValueError('Override does not exist')
+        data[key].remove(item)
+    try:
+        writej(path, data)
+        firewall()
+    except Exception:
+        atomic(path, original)
+        try:
+            firewall()
+        except Exception:
+            pass
+        raise
+    print(json.dumps(data, indent=2))
+
+def backup(destination=None):
+    if destination is None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        destination = '/root/awg-cascade-backups/' + stamp + '.tar.gz'
+    target = Path(destination).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if target.exists():
+        raise ValueError('Backup destination already exists')
+    paths = [BASE, CONF, Path('/etc/sysctl.d/90-cascade.conf'),
+             Path('/usr/local/sbin/cascadectl'), Path('/etc/unbound/cascade.conf'),
+             Path('/var/lib/unbound/cascade-root.key'),
+             Path('/etc/systemd/system/docker.service.d/cascade.conf')]
+    paths += list(Path('/etc/systemd/system').glob('cascade-*'))
+    paths += [Path('/usr/local/bin') / n for n in ['amneziawg-go', 'awg', 'awg-quick']]
+    for path in paths:
+        if target == path or path in target.parents:
+            raise ValueError('Backup destination must be outside the archived configuration')
+    # The archive includes private keys. Create it privately before writing any data.
+    fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as output, tarfile.open(fileobj=output, mode='w:gz') as archive:
+            for path in paths:
+                if path.exists():
+                    archive.add(path, arcname=str(path).lstrip('/'))
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    print(target)
+
+def alias(action, address=None):
+    s = state()
+    if s['role'] != 'eu':
+        raise ValueError('Aliases belong on the exit server')
+    path = BASE / 'eu-aliases.json'
+    owned = readj(path)
+    if action == 'restore':
+        for a in owned:
+            alias('prepare', a)
+        alias('activate', s.get('eu_active_ipv6', s['eu_ipv6']))
+        return
+    if action == 'status':
+        print(json.dumps(owned))
+        return
+    a = ipaddress.IPv6Address(address)
+    if a.scope_id is not None:
+        raise ValueError('IPv6 rotation addresses must be unscoped')
+    prefix = ipaddress.IPv6Network(s['eu_prefix'])
+    if a not in prefix or a == prefix.network_address:
+        raise ValueError('Address is outside the allocated subnet or is its subnet-router address')
+    address = str(a)
+    if action == 'activate':
+        if address != s['eu_ipv6'] and address not in owned:
+            raise ValueError('Address is not the primary address or a cascade-owned alias')
+        current = json.loads(run(['ip', '-j', '-6', 'address', 'show', 'dev', s['wan']]).stdout)
+        if not any(x['local'] == address for i in current for x in i['addr_info']):
+            raise ValueError('Prepare the IPv6 address before activating it')
+        routes = json.loads(run(['ip', '-j', '-6', 'route', 'show', 'default', 'dev', s['wan']]).stdout)
+        if not routes:
+            raise RuntimeError('No native IPv6 gateway is available')
+        route = min(routes, key=lambda x: x.get('metric', 0))
+        command = ['ip', '-6', 'route', 'replace', s['ru_ipv6'] + '/128']
+        if route.get('gateway'):
+            command += ['via', route['gateway']]
+        command += ['dev', s['wan'], 'src', address, 'metric', '50']
+        run(command)
+        if s.get('eu_active_ipv6') != address:
+            s['eu_active_ipv6'] = address
+            writej(BASE / 'state.json', s)
+        # Newly added IPv6 addresses must not become the source of an unrelated
+        # rekey. Pin the transport source and clear the old sticky socket source.
+        if Path('/var/run/amneziawg/awg-ru.sock').exists():
+            peers = run(['/usr/local/bin/awg', 'show', 'awg-ru', 'peers']).stdout.split()
+            if len(peers) == 1:
+                run(['/usr/local/bin/awg', 'set', 'awg-ru', 'peer', peers[0],
+                     'endpoint', '[' + s['ru_ipv6'] + ']:' + str(s['hop_port'])])
+        print('Activated transport source ' + address)
+        return
+    if action == 'drop':
+        if address == s.get('eu_active_ipv6', s['eu_ipv6']):
+            raise ValueError('Cannot retire the active transport address')
+        if address in owned:
+            current = json.loads(run(['ip', '-j', '-6', 'address', 'show', 'dev', s['wan']]).stdout)
+            if any(x['local'] == address for i in current for x in i['addr_info']):
+                run(['ip', '-6', 'address', 'del', address + '/128', 'dev', s['wan']])
+            writej(path, [x for x in owned if x != address])
+        print('Retired owned alias ' + address)
+        return
+    if action != 'prepare':
+        raise ValueError('Unknown alias operation')
+    current = json.loads(run(['ip', '-j', '-6', 'address', 'show', 'dev', s['wan']]).stdout)
+    present = any(x['local'] == address for i in current for x in i['addr_info'])
+    if present and address not in owned and address != s['eu_ipv6']:
+        raise ValueError('Address already belongs to another service; choose an unused address')
+    if not present:
+        if len(owned) >= 32:
+            raise ValueError('Retire old aliases before adding more')
+        # Persist before adding so a power loss cannot leave the active alias unrecorded.
+        if address not in owned:
+            writej(path, owned + [address])
+        run(['ip', '-6', 'address', 'add', address + '/128', 'dev', s['wan']])
+    for _ in range(60):
+        current = json.loads(run(['ip', '-j', '-6', 'address', 'show', 'dev', s['wan']]).stdout)
+        details = next((x for i in current for x in i['addr_info'] if x['local'] == address), None)
+        if details and (details.get('dadfailed') or 'dadfailed' in details.get('flags', [])):
+            raise RuntimeError('IPv6 duplicate-address detection failed')
+        if details and not details.get('tentative', False) and 'tentative' not in details.get('flags', []):
+            print('Prepared ' + address)
+            return
+        time.sleep(0.1)
+    raise RuntimeError('IPv6 alias did not become ready')
+
+def ssh_alias(s, action, address):
+    options = ['ssh', '-p', str(s.get('eu_ssh_port', 22)), '-i', str(BASE / 'rotation_ed25519'), '-o', 'BatchMode=yes',
+                '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+                '-o', 'HostKeyAlias=cascade-eu',
+                '-o', 'UserKnownHostsFile=' + str(BASE / 'eu_known_hosts'),
+                '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=5',
+                '-o', 'ServerAliveCountMax=2']
+    last = None
+    for host in [s['eu_admin_ipv4'], s['eu_primary_ipv6']]:
+        try:
+            return run(options + ['root@' + host, action + ' ' + address], timeout=25)
+        except Exception as e:
+            last = e
+    raise RuntimeError('EU management is unreachable over IPv4 and primary IPv6; '
+                       'prepare the address through the provider console, then use rotate --prepared IPv6: ' + str(last))
+
+def endpoint_set(address):
+    run(['nft', '-f', '-'], 'flush set inet cascade eu_endpoints6\n'
+        + 'add element inet cascade eu_endpoints6 { ' + address + ' }\n')
+
+def rotate(address=None, prepared=False):
+    s = state()
+    if s['role'] != 'ru':
+        raise ValueError('Run rotation on the Russian entry server')
+    prefix = ipaddress.IPv6Network(s['eu_prefix'])
+    address = str(ipaddress.IPv6Address(address)) if address else str(ipaddress.IPv6Address(int(prefix.network_address) | secrets.randbits(64)))
+    if '%' in address:
+        raise ValueError('IPv6 rotation addresses must be unscoped')
+    if ipaddress.IPv6Address(address) not in prefix or ipaddress.IPv6Address(address) == prefix.network_address:
+        raise ValueError('Address is outside the allocated subnet or is its subnet-router address')
+    old = s['eu_ipv6']
+    if address == old:
+        print('Endpoint is already ' + address)
+        return
+    if not prepared:
+        ssh_alias(s, 'prepare', address)
+    cfg = CONF / 'awg-eu.conf'
+    original = cfg.read_text()
+    def setlive(a):
+        endpoint_set(a)
+        run(['/usr/local/bin/awg', 'set', 'awg-eu', 'peer', s['eu_public_key'],
+             'endpoint', '[' + a + ']:' + str(s['hop_port'])])
+    def probe(a):
+        for _ in range(20):
+            result = run(['ping', '-n', '-I', '10.78.0.1', '-c', '1', '-W', '1', '10.78.0.2'], check=False, timeout=3)
+            if result.returncode == 0:
+                endpoint = run(['/usr/local/bin/awg', 'show', 'awg-eu', 'endpoints']).stdout
+                if '[' + a + ']:' in endpoint:
+                    return True
+            time.sleep(0.25)
+        return False
+    try:
+        setlive(address)
+        if not prepared:
+            ssh_alias(s, 'activate', address)
+        if not probe(address):
+            raise RuntimeError('New endpoint failed the authenticated tunnel probe')
+        updated, count = re.subn(r'^Endpoint\s*=.*$', f'Endpoint = [{address}]:{s["hop_port"]}', original, flags=re.M)
+        if count != 1:
+            raise RuntimeError('Expected exactly one cascade peer endpoint')
+        atomic(cfg, updated)
+        s['eu_ipv6'] = address
+        writej(BASE / 'state.json', s)
+        # Keep the generated firewall snapshot in sync with the persisted endpoint.
+        firewall()
+    except Exception:
+        s['eu_ipv6'] = old
+        writej(BASE / 'state.json', s)
+        atomic(cfg, original)
+        setlive(old)
+        firewall()
+        if not prepared:
+            try:
+                ssh_alias(s, 'activate', old)
+                ssh_alias(s, 'drop', address)
+            except Exception:
+                pass
+        restored = probe(old)
+        if not restored:
+            raise RuntimeError('New endpoint failed; the previous endpoint configuration was restored, '
+                               'but its tunnel probe is also failing')
+        raise
+    try:
+        ssh_alias(s, 'drop', old)
+    except Exception as e:
+        print('New endpoint active; old alias cleanup needs attention: ' + str(e), file=sys.stderr)
+    print(json.dumps({'previous_endpoint': old, 'active_endpoint': address,
+                      'client_configuration_changed': False}))
+
+def status(health=False):
+    s = state()
+    names = ['awg-clients', 'awg-eu'] if s['role'] == 'ru' else ['awg-ru']
+    summary = {'role': s['role'], 'public_ipv4': s['public_ipv4'], 'interfaces': {}}
+    if s['role'] == 'ru':
+        summary['eu_ipv6'] = s['eu_ipv6']
+    else:
+        summary['primary_ipv6'] = s['eu_ipv6']
+        summary['active_transport_ipv6'] = s.get('eu_active_ipv6', s['eu_ipv6'])
+        summary['managed_ipv6_aliases'] = readj(BASE / 'eu-aliases.json')
+    for name in names:
+        summary['interfaces'][name] = {field: run(['/usr/local/bin/awg', 'show', name, field], check=False).stdout.strip()
+             for field in ['public-key', 'endpoints', 'latest-handshakes', 'transfer']}
+        if health and not summary['interfaces'][name]['public-key']:
+            raise RuntimeError('Managed interface is unavailable: ' + name)
+    if health and s['role'] != 'ru':
+        raise ValueError('Run the end-to-end health check on the entry; use status on the exit')
+    if health and s['role'] == 'ru':
+        for attempt in range(3):
+            result = run(['ping', '-n', '-I', '10.78.0.1', '-c', '1', '-W', '3', '10.78.0.2'], check=False, timeout=5)
+            if result.returncode == 0:
+                break
+        else:
+            raise RuntimeError('The interserver tunnel failed its reachability probes')
+        dns = run(['dig', '-b', '10.78.0.1', '@10.78.0.2', 'example.com', 'A', '+short', '+time=3', '+tries=1'], timeout=6)
+        if not dns.stdout.strip():
+            raise RuntimeError('DNS returned no answer')
+    print(json.dumps(summary, indent=2))
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='command', required=True)
+    for name, help_text in [('status', 'Show public runtime information'),
+                            ('health', 'Probe the entry, exit tunnel and private DNS'),
+                            ('firewall', 'Atomically reload project firewall rules'),
+                            ('geo-update', 'Refresh validated Russian destination prefixes'),
+                            ('sync-clients', 'Rebuild the entry config from its saved client database'),
+                            ('docker-allow', 'Restore scoped permissions in DOCKER-USER'),
+                            ('remote-alias', 'Restricted SSH command; not for interactive use')]:
+        sub.add_parser(name, help=help_text)
+    for name in ['up', 'down']:
+        sub.add_parser(name, help='Internal systemd interface action').add_argument('interface')
+    clients = sub.add_parser('client', help='Manage entry client profiles').add_subparsers(dest='action', required=True)
+    for name in ['add', 'remove']:
+        clients.add_parser(name).add_argument('name')
+    clients.add_parser('list')
+    aliases = sub.add_parser('alias', help='Manage exit IPv6 addresses').add_subparsers(dest='action', required=True)
+    for name in ['prepare', 'activate', 'drop']:
+        aliases.add_parser(name).add_argument('address')
+    for name in ['restore', 'status']:
+        aliases.add_parser(name)
+    rotations = sub.add_parser('rotate', help='Rotate the exit endpoint from the entry')
+    rotations.add_argument('address', nargs='?')
+    rotations.add_argument('--prepared', action='store_true', help='Use an address already prepared and activated on the exit')
+    overrides = sub.add_parser('override', help='Manage destination CIDR exceptions').add_subparsers(dest='action', required=True)
+    overrides.add_parser('list')
+    for name in ['add', 'remove']:
+        item = overrides.add_parser(name)
+        item.add_argument('destination', choices=['russia', 'europe'])
+        item.add_argument('cidr')
+    sub.add_parser('backup', help='Archive private project configuration').add_argument('destination', nargs='?')
+    return p
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if os.geteuid() != 0:
+        raise RuntimeError('Run this command as root, for example with sudo')
+    cmd = args.command
+    if cmd == 'remote-alias':
+        original = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+        if len(original) != 2 or original[0] not in ['prepare', 'activate', 'drop']:
+            raise ValueError('Only prepare IPv6, activate IPv6 and drop IPv6 are allowed through this SSH key')
+        with lock():
+            alias(*original)
+    elif cmd in ['status', 'health']:
+        status(cmd == 'health')
+    else:
+        with lock():
+            if cmd == 'firewall': firewall()
+            elif cmd in ['up', 'down']: interface(cmd, args.interface)
+            elif cmd == 'docker-allow': docker_allow()
+            elif cmd == 'geo-update': geo_update()
+            elif cmd == 'client': client(args.action, getattr(args, 'name', None))
+            elif cmd == 'sync-clients': sync_clients()
+            elif cmd == 'alias': alias(args.action, getattr(args, 'address', None))
+            elif cmd == 'rotate':
+                if args.prepared and not args.address:
+                    raise ValueError('--prepared requires an IPv6 address')
+                rotate(args.address, prepared=args.prepared)
+            elif cmd == 'override': override(args.action, getattr(args, 'destination', None), getattr(args, 'cidr', None))
+            elif cmd == 'backup': backup(args.destination)
+            else: raise ValueError('Invalid command')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print('cascade: ' + str(e), file=sys.stderr)
+        sys.exit(1)

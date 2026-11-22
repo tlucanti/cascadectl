@@ -1,0 +1,8 @@
+[Unit]
+Description=Check cascade tunnel and private DNS
+After=cascade-awg@awg-eu.service
+[Service]
+Type=oneshot
+StandardOutput=null
+ExecStart=/usr/local/sbin/cascadectl health
+TimeoutStartSec=20

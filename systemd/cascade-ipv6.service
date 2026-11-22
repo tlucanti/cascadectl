@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore cascade-owned European IPv6 aliases
+Wants=network-online.target
+After=network-online.target
+Before=cascade-awg@awg-ru.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cascadectl alias restore
+[Install]
+WantedBy=multi-user.target

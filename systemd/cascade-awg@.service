@@ -1,0 +1,22 @@
+[Unit]
+Description=AmneziaWG cascade interface %i
+Wants=network-online.target
+Requires=cascade-firewall.service
+After=network-online.target cascade-firewall.service
+[Service]
+Type=simple
+Environment=LOG_LEVEL=error
+ExecStartPre=-/usr/local/sbin/cascadectl down %i
+ExecStart=/usr/local/bin/amneziawg-go -f %i
+ExecStartPost=/usr/local/sbin/cascadectl up %i
+ExecStopPost=-/usr/local/sbin/cascadectl down %i
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run
+[Install]
+WantedBy=multi-user.target

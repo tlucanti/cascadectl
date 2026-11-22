@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh validated Russian IP prefixes
+After=network-online.target cascade-firewall.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cascadectl geo-update
+TimeoutStartSec=60

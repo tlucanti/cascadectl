@@ -1,0 +1,28 @@
+# Deployment-specific settings and all generated access material
+/config.local.json
+/config.*.local.json
+/.local/
+/profiles/
+/backups/
+*.key
+*.pem
+*.psk
+*.password
+rotation_ed25519*
+/clients.json
+/state.json
+/awg-*.conf
+/entry-obfuscation.conf
+/hop-obfuscation.conf
+*.vpn
+*.zip
+*.tar.gz
+
+# Python and editor scratch files
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+.pytest_cache/
+.DS_Store
+*.swp

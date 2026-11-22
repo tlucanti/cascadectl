@@ -1,0 +1,13 @@
+[Unit]
+Description=Private cascade DNS resolver on the European exit
+Requires=cascade-awg@awg-ru.service
+After=network-online.target cascade-awg@awg-ru.service
+PartOf=cascade-awg@awg-ru.service
+[Service]
+Type=simple
+ExecStart=/usr/sbin/unbound -d -c /etc/unbound/cascade.conf
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=4096
+[Install]
+WantedBy=multi-user.target

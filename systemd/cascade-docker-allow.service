@@ -1,0 +1,11 @@
+[Unit]
+Description=Permit cascade forwarding through Docker's existing firewall
+Requires=docker.service
+After=docker.service cascade-firewall.service
+Before=cascade-awg@awg-ru.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cascadectl docker-allow
+[Install]
+WantedBy=multi-user.target
